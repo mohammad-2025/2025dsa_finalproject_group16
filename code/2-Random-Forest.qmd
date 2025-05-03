@@ -1,0 +1,432 @@
+---
+title: "Random_Forest"
+author: "Mohammad Mehralian"  
+format:
+  html:
+    code-fold: true 
+    embed-resources: true
+    toc: true
+    number-sections: true
+    theme: cerulean
+---
+# Setup  
+
+##Loading packages 
+```{r setup, warning=FALSE, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(vip)
+library(ranger)
+library(finetune)
+library(vip)
+library(forcats)
+
+```
+
+
+```{r}
+weather = read_csv("../data/merged_f.csv")%>%
+  select(-DAP)
+
+weather
+read_csv("../data/merged_f.csv") %>% colnames()
+```
+
+
+# 1. Pre-processing
+```{r }
+
+set.seed(1681550) 
+
+weather_split = initial_split(weather, 
+  prop = .7, 
+  strata = yield_mg_ha)
+
+weather_split
+
+```
+
+## Data split
+
+```{r }
+weather_train = training(weather_split)  
+
+weather_train 
+```
+
+
+```{r }
+weather_test = testing(weather_split)    
+
+weather_test
+```
+
+
+## Distribution of target variable
+
+```{r }
+ggplot() +
+  geom_density(data = weather_train, 
+               aes(x = yield_mg_ha),
+               color = "red") +
+  geom_density(data = weather_test, 
+               aes(x = yield_mg_ha),
+               color = "blue") 
+  
+```
+
+## recipe
+```{r }
+weather_recipe <- recipe(yield_mg_ha ~ ., data = weather_train) %>%
+  step_normalize(all_numeric_predictors())
+  
+weather_recipe
+```
+
+```{r }
+weather_prep <- weather_recipe %>% 
+  prep()
+
+weather_prep
+```
+
+# 2. Training
+## Model specification
+
+```{r }
+rf_spec <- rand_forest(
+  trees = tune(),
+  mtry = tune()
+  ) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+rf_spec
+
+```
+
+## Cross-validation setup
+
+We use 5-fold cross-validation to evaluate model performance during tuning:
+
+```{r}
+
+set.seed(1681550) 
+
+resampling_foldcv = vfold_cv(weather_train, 
+                              v = 4)
+
+resampling_foldcv
+
+resampling_foldcv$splits[[1]]
+
+```
+
+## Hyperparameter grid
+```{r }
+set.seed(1681550)
+rf_grid_result <- tune_sim_anneal(object = rf_spec,
+                     preprocessor = weather_recipe,
+                     resamples = resampling_foldcv,
+                    #param_info = rf_param,
+                    iter = 4
+                     )
+
+beepr::beep()
+
+rf_grid_result
+rf_grid_result$.metrics[[2]]
+```
+
+
+
+```{r}
+rf_grid_result %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = mtry, 
+             y = trees 
+             )) +
+  geom_path(group = 1) +
+  geom_point(aes(color = mean),
+             size = 3) + 
+  scale_color_viridis_b() +
+  geom_text(aes(label = .iter), nudge_x = .0005) +
+  labs(title = "RMSE")
+```
+
+
+```{r}
+rf_grid_result %>%
+  collect_metrics() %>%
+  filter(.metric == "rsq") %>%
+  ggplot(aes(x = mtry, 
+             y = trees 
+             )) +
+  geom_path(group = 1) +
+  geom_point(aes(color = mean),
+             size = 3) + 
+  scale_color_viridis_b() +
+  geom_text(aes(label = .iter), nudge_x = .0005) +
+  labs(title = "R2")
+```
+
+
+```{r }
+best_rmse <- rf_grid_result %>%
+  select_by_pct_loss("trees", 
+                        metric = "rmse",
+                        limit = 2
+                     )
+best_rmse
+
+
+```
+
+```{r}
+best_r2 <- rf_grid_result  %>%
+  select_by_pct_loss("trees", 
+                        metric = "rsq",
+                        limit = 2
+                     )
+
+
+best_r2
+```
+
+## final_spec
+```{r}
+final_spec <- rand_forest(trees = best_r2$trees,
+                          mtry = best_r2$mtry) %>%
+  # Specify the engine
+  set_engine("ranger",
+             importance = "permutation") %>%
+    # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+
+
+```{r}
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+
+
+
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+
+
+## Metrics
+```{r}
+# RMSE
+final_spec %>%
+  fit(yield_mg_ha ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(yield_mg_ha, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(yield_mg_ha ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(yield_mg_ha, .pred)
+    
+  )
+```
+
+
+# 3.Predictions
+```{r}
+final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = yield_mg_ha,
+             y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm") +
+  scale_x_continuous(limits = c(0, 20)) +
+  scale_y_continuous(limits = c(0, 20)) 
+```
+
+```{r}
+library(ggplot2)
+
+
+plot <- final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = yield_mg_ha, y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm") +
+  scale_x_continuous(limits = c(0, 20)) +
+  scale_y_continuous(limits = c(0, 20))
+
+
+ggsave("predicted_vs_observed_plot.svg", plot = plot, device = "svg", width = 8, height = 6)
+
+
+```
+
+
+## variable importance
+```{r}
+final_spec %>%
+  fit(yield_mg_ha ~ .,
+         data = bake(weather_prep, weather)) %>%
+    vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+    
+```
+
+
+
+
+# 4. Prediction on Test data
+```{r}
+library(ggplot2)
+library(dplyr)
+library(forcats)
+
+
+plot <- final_spec %>%
+  fit(yield_mg_ha ~ .,
+      data = bake(weather_prep, weather)) %>%
+  vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+
+ggsave("variable_importance_plot.svg", plot = plot, device = "svg", width = 8, height = 6)
+
+
+```
+
+```{r}
+library(readr)
+library(dplyr)
+
+```
+
+```{r }
+weather_test <- read_csv("../data/testing/weather_2024A.csv") %>%
+  distinct(year, site, .keep_all = TRUE)
+
+trait_test <- read_csv("../data/testing/testing_submission.csv")
+
+trait_weather_test <- left_join(trait_test, weather_test, by = c("year", "site"))
+
+soil_test <- read_csv("../data/testing/testing_soil.csv") %>%
+  distinct(year, site, .keep_all = TRUE)
+
+tw_soil_test <- left_join(trait_weather_test, soil_test, by = c("year", "site"))
+
+meta_test <- read_csv("../data/testing/testing_meta.csv")
+
+tw_sm_meta_test <- left_join(tw_soil_test, meta_test, by = c("year", "site")) %>%
+  mutate(
+    yield_mg_ha = as.numeric(yield_mg_ha),
+    swe_kg_m_2  = as.numeric(swe_kg_m_2)
+  )
+
+final_merged_test <- tw_sm_meta_test #%>%
+  #select(-year, -hybrid, -previous_crop,
+        # -longitude, -latitude, -lon, -lat)
+#colnames(final_merged_test)
+
+```
+
+
+## Random Forest — Training and Prediction
+```{r }
+best_rf <- rf_grid_result %>%
+  select_best(metric = "rsq")
+
+
+final_spec <- rand_forest(trees = best_rf$trees,
+                          mtry = best_rf$mtry) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+final_rf_wf <- workflow() %>%
+  add_recipe(weather_recipe) %>%
+  add_model(final_spec) %>%
+  finalize_workflow(best_rf)
+
+fitted_rf <- final_rf_wf %>%
+  fit(data = training(weather_split))
+
+predictions <- predict(fitted_rf, new_data = final_merged_test) %>%
+  bind_cols(final_merged_test %>% select(site)) %>%
+  rename(predicted_yield = .pred)
+
+```
+
+```{r}
+dir.create("output", showWarnings = FALSE)
+saveRDS(fitted_rf, file = "output/final_rf_model.rds")
+```
+
+
+```{r }
+write_csv(predictions, "../data/testing/Predicted_RandomForest_test.csv")
+```
+
+
+```{r}
+View(predictions)           
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(predictions, aes(x = site, y = predicted_yield)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Predicted Maize Yield by Site", x = "Site", y = "Predicted Yield (mg/ha)")
+
+beepr::beep()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
