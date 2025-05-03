@@ -1,0 +1,487 @@
+---
+title: "XGboost ML"
+author: "Mohammad Mehralian"  
+format:
+  html:
+    code-fold: true 
+    embed-resources: true
+    toc: true
+    number-sections: true
+    theme: cerulean
+---
+
+# libraries
+```{r setup, warning=FALSE, message=FALSE}
+library(readr)        
+library(janitor)      
+library(dplyr)        
+library(tidyr)        
+library(lubridate)    
+library(tidyverse)  
+library(ggplot2)      
+library(corrplot)     
+library(nnet)
+library(hardhat)   
+library(dials)     
+library(xgboost)      
+library(ranger)       
+library(recipes)      
+library(caret)
+library(finetune)     
+library(tune)         
+library(rsample)      
+library(yardstick)    
+library(vip)        
+library(pROC)        
+library(doParallel)   
+library(future)
+library(parsnip)
+library(tidymodels)
+```
+
+
+```{r}
+weather = read_csv("../data/merged_f.csv")
+
+weather
+```
+
+# 1.Pre-processing
+```{r }
+set.seed(1681550)
+
+weather_split <- initial_split(
+  data   = weather,
+  prop   = 0.7,
+  strata = yield_mg_ha
+)
+
+weather_split
+```
+
+## Data split
+```{r }
+train_data = training(weather_split)  
+train_data 
+```
+
+```{r }
+test_data = testing(weather_split)  # 30% of data
+test_data
+```
+
+##  Distribution of target variable
+```{r }
+ggplot() +
+  geom_density(data = train_data, 
+               aes(x = yield_mg_ha),
+               color = "red") +
+  geom_density(data = test_data, 
+               aes(x = yield_mg_ha),
+               color = "blue") 
+  
+```
+
+## recipe
+```{r}
+weather_recipe <- recipe(yield_mg_ha ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+weather_recipe
+
+```
+
+```{r}
+weather_prep <- weather_recipe %>% 
+  prep()
+
+weather_prep 
+```
+
+# 2.Training
+## Model specification
+```{r }
+xgb_spec <- boost_tree(
+  trees      = tune(),  
+  tree_depth = tune(),  
+  min_n      = tune(),  
+  learn_rate = tune()   
+) %>%
+  set_engine("xgboost") %>%  
+  set_mode("regression")     
+
+xgb_spec
+```
+
+## Cross-validation 
+```{r }
+set.seed(1681550)
+
+resampling_foldcv = vfold_cv(train_data, 
+                             v = 5) 
+resampling_foldcv
+resampling_foldcv$splits[[1]]
+```
+
+## Latin Hypercube Sampling
+```{r }
+xgb_grid = grid_space_filling(
+  tree_depth(),
+  min_n(),
+  learn_rate(),
+  trees(),
+  size = 10
+)
+
+```
+
+```{r }
+ggplot(data = xgb_grid,
+       aes(x = tree_depth, 
+           y = min_n)) +
+  geom_point(aes(color = factor(learn_rate),
+                 size = trees),
+             alpha = .5,
+             show.legend = FALSE)
+```
+
+
+# 3.workflow
+```{r }
+set.seed(1681550)
+
+options(future.globals.maxSize = 2 * 1024^3)
+plan(multisession, workers = parallel::detectCores() - 1)
+
+weather_wflow <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(weather_recipe)
+
+
+#plan(sequential)
+
+xgb_res <- tune_race_anova(
+  object = weather_wflow,
+  resamples = resampling_foldcv,
+  grid = xgb_grid,
+  control = control_race(save_pred = TRUE))
+
+beepr::beep()
+xgb_res$.metrics[[2]]
+```
+
+
+## Select Best Models
+```{r}
+best_rmse <- xgb_res %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse")
+
+best_rmse
+```
+
+```{r}
+best_rmse_pct_loss <- xgb_res %>% 
+  select_by_pct_loss("min_n",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse_pct_loss")
+
+best_rmse_pct_loss
+```
+
+```{r}
+best_rmse_one_std_err <- xgb_res %>% 
+  select_by_one_std_err(metric = "rmse",
+                        eval_time = 100,
+                        trees
+                        )%>% 
+  mutate(source = "best_rmse_one_std_err")
+
+best_rmse_one_std_err
+```
+
+```{r}
+best_r2 <- xgb_res %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2")
+
+best_r2
+```
+
+```{r}
+best_r2_pct_loss <- xgb_res %>% 
+  select_by_pct_loss("min_n",
+                     metric = "rsq",
+                     limit = 1
+                     ) %>% 
+  mutate(source = "best_r2_pct_loss")
+
+best_r2_pct_loss
+```
+
+```{r}
+best_r2_one_std_error <- xgb_res %>% 
+  select_by_one_std_err(metric = "rsq",
+                        eval_time = 100,
+                        trees
+                        ) %>%
+  mutate(source = "best_r2_one_std_error")
+
+best_r2_one_std_error
+```
+
+# 4.Compare and Finalize Model
+```{r}
+best_rmse %>% 
+  bind_rows(best_rmse_pct_loss, 
+            best_rmse_one_std_err, 
+            best_r2, 
+            best_r2_pct_loss, 
+            best_r2_one_std_error)
+```
+
+## Final Specification
+```{r}
+final_spec <- boost_tree(
+  trees = best_r2$trees,           
+  tree_depth = best_r2$tree_depth, 
+  min_n = best_r2$min_n,           
+  learn_rate = best_r2$learn_rate  
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+final_spec
+```
+
+
+
+# 5.Validation
+```{r final_fit}
+set.seed(1681550)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+
+## Evaluate on Test Set
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+
+## Evaluate on Training Set
+```{r}
+final_spec %>%
+  fit(yield ~ .,
+      data = bake(weather_prep, 
+                  train_data)) %>%
+  augment(new_data = bake(weather_prep, 
+                          train_data)) %>% 
+  rmse(yield, .pred) %>%
+  bind_rows(
+    
+    
+# R2
+final_spec %>%
+  fit(yield ~ .,
+      data = bake(weather_prep, 
+                  train_data)) %>%
+  augment(new_data = bake(weather_prep, 
+                          train_data)) %>% 
+  rsq(yield, .pred))
+```
+
+## Predicted vs Observed Plot
+```{r}
+preds_in_range <- 
+  final_fit %>%
+  collect_predictions() %>%
+  filter(
+    between(yield, 0, 20),
+    between(.pred,        0, 20),
+    !is.na(.pred)
+  )
+
+ggplot(preds_in_range, aes(x = yield, y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm", formula = y ~ x) +
+    labs(
+    x = "Observed Yield (Mg ha⁻¹)",
+    y = "Predicted Yield (Mg ha⁻¹)",
+    title = "Observed vs. Predicted Cotton Yield"
+  )
+
+```
+
+# 6.Variable Importance
+```{r}
+final_spec %>%
+  fit(yield ~ .,
+         data = bake(weather_prep, train_data)) %>% 
+    vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+
+
+
+
+
+
+
+# 4. Prediction on Test data
+```{r}
+library(ggplot2)
+library(dplyr)
+library(forcats)
+
+
+plot <- final_spec %>%
+  fit(yield_mg_ha ~ .,
+      data = bake(weather_prep, weather)) %>%
+  vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+
+ggsave("variable_importance_plot.svg", plot = plot, device = "svg", width = 8, height = 6)
+
+
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+
+```
+
+```{r }
+weather_test <- read_csv("../data/testing/weather_2024A.csv") %>%
+  distinct(year, site, .keep_all = TRUE)
+
+trait_test <- read_csv("../data/testing/testing_submission.csv")
+
+trait_weather_test <- left_join(trait_test, weather_test, by = c("year", "site"))
+
+soil_test <- read_csv("../data/testing/testing_soil.csv") %>%
+  distinct(year, site, .keep_all = TRUE)
+
+tw_soil_test <- left_join(trait_weather_test, soil_test, by = c("year", "site"))
+
+meta_test <- read_csv("../data/testing/testing_meta.csv")
+
+tw_sm_meta_test <- left_join(tw_soil_test, meta_test, by = c("year", "site")) %>%
+  mutate(
+    yield_mg_ha = as.numeric(yield_mg_ha),
+    swe_kg_m_2  = as.numeric(swe_kg_m_2)
+  )
+
+final_merged_test <- tw_sm_meta_test #%>%
+  #select(-year, -hybrid, -previous_crop,
+        # -longitude, -latitude, -lon, -lat)
+#colnames(final_merged_test)
+
+```
+
+
+## Random Forest — Training and Prediction
+```{r }
+best_rf <- rf_grid_result %>%
+  select_best(metric = "rsq")
+
+
+final_spec <- rand_forest(trees = best_rf$trees,
+                          mtry = best_rf$mtry) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+final_rf_wf <- workflow() %>%
+  add_recipe(weather_recipe) %>%
+  add_model(final_spec) %>%
+  finalize_workflow(best_rf)
+
+fitted_rf <- final_rf_wf %>%
+  fit(data = training(weather_split))
+
+predictions <- predict(fitted_rf, new_data = final_merged_test) %>%
+  bind_cols(final_merged_test %>% select(site)) %>%
+  rename(predicted_yield = .pred)
+```
+
+
+```{r }
+write_csv(predictions, "../data/testing/Predicted_RandomForest_test.csv")
+```
+
+
+```{r}
+View(predictions)           
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(predictions, aes(x = site, y = predicted_yield)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Predicted Maize Yield by Site", x = "Site", y = "Predicted Yield (mg/ha)")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
