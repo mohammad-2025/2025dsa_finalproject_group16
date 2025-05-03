@@ -1,0 +1,385 @@
+---
+title: "Wrangling and Feature engineering"
+author: "Mohammad Mehralian"  
+format:
+  html:
+    code-fold: true 
+    embed-resources: true
+    toc: true
+    number-sections: true
+    theme: cerulean
+---
+# Setup  
+
+##Loading packages  
+```{r setup, warning=FALSE, message=FALSE}
+#install.packages("USAboundariesData")
+#install.packages("remotes")
+#remotes::install_github("ropensci/USAboundaries")
+#remotes::install_github("ropensci/USAboundariesData")
+#install.packages("ggridges")
+library(ggridges)
+library(readr) 
+library(lubridate)
+library(stringr)
+library(tidyverse)
+library(readxl) 
+library(janitor) 
+library(dplyr) 
+library(tidyr) 
+library(sf) 
+library(daymetr) 
+library(remotes)
+library(USAboundaries) 
+library(USAboundariesData)
+```
+
+## Reading data  
+```{r }
+trait_df = read_csv("../data/training/training_trait.csv") 
+
+trait_df
+
+summary(trait_df)
+```
+
+```{r}
+meta_df  = read_csv("../data/training/training_meta.csv")
+
+meta_df
+
+summary(meta_df)
+```
+
+```{r}
+soil_df  = read_csv("../data/training/training_soil.csv")
+
+soil_df
+
+summary(soil_df)
+```
+# 1- Wrangling
+## Trait Wrangling
+```{r}
+Ref_yield = function(yield_mg_ha, grain_moisture) {
+  yield_mg_ha * (100 - grain_moisture) / (100)
+}
+```
+
+```{r}
+trait_Wr = trait_df %>%
+  select(-block) %>%
+  mutate(
+    site = str_remove_all(site, "[a-z]"), 
+    site = str_replace(site, "-.*$", ""), 
+    site = str_replace(site, "_.*$", "")
+  ) %>%
+  group_by(year, site, hybrid) %>%
+  summarize(
+    yield_mg_ha    = mean(yield_mg_ha, na.rm = TRUE),
+    grain_moisture = mean(grain_moisture, na.rm = TRUE),
+    date_planted   = first(date_planted),
+    date_harvested = first(date_harvested),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Ref_yield = Ref_yield(yield_mg_ha, grain_moisture),
+    planting_date  = as.Date(date_planted,   "%m/%j/%y"),
+    harvest_date   = as.Date(date_harvested, "%m/%j/%y"),
+    plant_doy      = yday(planting_date),
+    harvest_doy    = yday(harvest_date),
+  ) %>%
+  select(-yield_mg_ha, -grain_moisture, -date_planted, -date_harvested, -planting_date, -harvest_date) %>%
+  ungroup()
+
+
+trait_Wr
+
+```
+
+## Soil Wrangling
+```{r }
+soil_wr = soil_df %>%
+  mutate(
+    site = str_remove_all(site, "[a-z]"),
+    site = str_replace(site, "-.*$", ""),
+    site = str_replace(site, "_.*$", "")
+  ) %>%
+  ungroup()
+
+soil_wr
+```
+
+## Meta Wrangling_
+```{r }
+meta_wr1 = meta_df %>%
+  rename(
+    lon = longitude,
+    lat = latitude
+  ) %>%
+  mutate(site = str_remove_all(site, "[a-z]"),
+         site = str_replace(site, "-.*$", ""),
+         site = str_replace(site, "_.*$", "")) %>%
+  distinct(year, site, .keep_all = TRUE) %>%
+  ungroup()
+
+meta_wr1
+```
+
+
+```{r}
+meta_wr = meta_wr1 %>%
+  mutate(
+      prev_crop_raw = str_to_lower(str_squish(previous_crop)),
+      prev_crop = case_when(
+      prev_crop_raw == "cotton"                                   ~ "cotton",
+      prev_crop_raw == "peanut"                                   ~ "peanut",
+      prev_crop_raw %in% c("soybean", "soybeans")                 ~ "soybean",
+      prev_crop_raw == "sorghum"                                  ~ "sorghum",
+      prev_crop_raw %in% c("wheat", "winter wheat", "2019/20 wheat") ~ "wheat",
+      TRUE                                                         ~ "others"
+    ) %>%
+      factor(levels = c("cotton", "peanut", "soybean", "sorghum", "wheat", "others"))
+  ) %>%
+  select(-previous_crop, -prev_crop_raw) %>%
+  clean_names()
+
+meta_wr
+
+```
+
+### Merging
+```{r}
+merged  = trait_Wr %>%
+  left_join(soil_wr, by = c("year", "site")) %>%
+  left_join(meta_wr, by = c("year", "site"))
+
+merged
+```
+
+### USA map
+```{r }
+states = us_states() %>% 
+  filter( !(state_abbr %in% c("PR", "AK", "HI")) )
+ggplot() +
+  geom_sf(data = states) + 
+  geom_point(data = merged,
+             aes(x = lon, 
+                 y = lat)) +
+  labs(title = "Corn Site Locations",
+       x="Long",
+       y ="Lati")
+```
+
+### Geographic Boundaries
+```{r}
+min_lat <- 14.53
+max_lat <- 52.00
+min_lon <- -131.104
+max_lon <- -52.95
+```
+
+### Filtering and Removing Observations with Missing Coordinate Values
+```{r}
+merged_1 <- merged %>%
+  filter(
+    !is.na(lat),
+    !is.na(lon),
+    lat  >= min_lat,
+    lat  <= max_lat,
+    lon  >= min_lon,
+    lon  <= max_lon
+  )
+
+message("Rows kept: ", nrow(merged_1), 
+        " (dropped: ", nrow(merged) - nrow(merged_1), ")")
+```
+
+### Extracting Site-Year with Coordinates
+```{r }
+site_year <- merged_1 %>%
+  select(year, site, lon, lat) %>%
+  distinct() %>%                    
+  arrange(year, site)
+
+site_year
+
+```
+
+# 2- Downloading Daymet Weather Data
+```{r}
+Daymet = site_year %>% 
+  mutate(weather = pmap(list(.y = year, .site = site, .lat = lat,.lon = lon), 
+                        function(.y, .site, .lat, .lon) 
+                        download_daymet(site = .site,lat = .lat,lon = .lon, start = .y, end = .y,simplify = T,silent = T) 
+                        %>%
+                          rename(.year = year,
+                                 .site = site))) 
+
+Daymet
+
+```
+
+## Daymet Wide Format
+```{r}
+Daymet_unnest = Daymet %>%
+  select(year, site, weather) %>% 
+  unnest(weather) %>% 
+  pivot_wider(names_from = measurement, 
+              values_from = value) %>% 
+  janitor::clean_names()
+
+Daymet_unnest
+```
+
+
+## Merging Daymet 
+```{r }
+Daymet_all = merged %>%
+  left_join(Daymet_unnest,
+    by = c("year", "site"))
+Daymet_all
+```
+
+
+```{r}
+weather = Daymet_all
+
+weather
+
+```
+
+# 3- Feature engineering
+```{r}
+weather_m = weather %>%
+   dplyr::select(year, 
+                site, 
+                hybrid, 
+                lon, 
+                lat, 
+                yday, 
+                yield = Ref_yield, 
+                prev_crop,
+                plant_doy,
+                harvest_doy,
+                soil.ph = soilpH, 
+                soil.om.pct = om_pct, 
+                soil.k.ppm = soilk_ppm, 
+                soil.p.ppm = soilp_ppm, 
+                dayl.s = dayl_s, 
+                prcp.mm = prcp_mm_day, 
+                srad.wm2 = srad_w_m_2,
+                tmax.c = tmax_deg_c, 
+                tmin.c = tmin_deg_c,
+                vp.pa = vp_pa) %>%
+   mutate(date = as.Date(paste0(year, "/", yday), "%Y/%j")) %>% 
+   mutate(month = month(date), 
+         month_abb = month(date, label = TRUE))
+
+weather_m
+```
+
+## Processing-Planting and Harvest Stage
+```{r}
+weather_m = weather_m%>%
+  mutate(
+    planting_stages = case_when(
+      plant_doy <= 100                    ~ "early",    
+      plant_doy >= 101 & plant_doy <= 130  ~ "normal",  
+      plant_doy > 130                     ~ "late",     
+      TRUE                                ~ NA_character_) %>%
+      fct_relevel("early", "normal", "late"),
+    
+    harvest_stages = case_when(
+      harvest_doy <= 260                    ~ "early",  
+      harvest_doy >= 261 & harvest_doy <= 290 ~ "normal",   
+      harvest_doy > 290                     ~ "late",     
+      TRUE                                   ~ NA_character_) %>% 
+      fct_relevel("early","normal","late")
+  ) %>%
+  select(-plant_doy, -plant_doy)
+
+weather_m
+```
+
+
+## Summarizing Variables by Month
+```{r }
+weather_s = weather_m %>%
+  group_by(year, site, hybrid, lon, lat, month_abb, yield, prev_crop, planting_stages, harvest_stages) %>% 
+  summarise(across(.cols = c(soil.ph, 
+                             soil.om.pct, 
+                             soil.k.ppm, 
+                             soil.p.ppm,
+                             dayl.s,
+                             srad.wm2,
+                             tmax.c,
+                             tmin.c,
+                             vp.pa),
+                   .fns = mean, 
+                   .names = "mean_{.col}"),across(.cols = prcp.mm,
+                   .fns = sum,
+                   .names = "sum_{.col}"
+                   )) %>%
+  ungroup() 
+
+weather_s
+```
+
+## Reshaping and Summarizing
+```{r}
+weather_s_wide = weather_s %>%
+  pivot_longer(cols = starts_with("mean_") | starts_with("sum_")) %>%
+  mutate(varname = paste0(name, "_", month_abb)) %>%
+  select(-name, -month_abb) %>%
+  pivot_wider(names_from = varname, values_from = value) %>%
+  mutate(across(10:ncol(.), ~ round(., 1))) %>%
+  select(-matches("_NA$"))
+
+weather_s_wide
+
+View(weather_s_wide)
+
+```
+
+
+### Distribution of one variable (Max Temp) Across Months
+```{r }
+ggplot(data = weather_s,
+       aes(x = mean_tmax.c, y = month_abb, fill = stat(x))) +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+  scale_fill_viridis_c(option = "C") +
+  theme(legend.position = "none")
+
+
+```
+
+
+## Ridge Plot Visualization of Weather Variables Across Months
+```{r}
+finalplots = weather_s %>%
+  pivot_longer(cols = mean_soil.ph:sum_prcp.mm) %>%
+  group_by(name) %>%
+  nest() %>%
+  mutate(plot = map2(data, name, 
+                     ~ ggplot(data = .x, 
+                              aes(x = value, y = month_abb, fill = stat(x))) +
+                         geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) + 
+                         scale_fill_viridis_c(option = "C") + 
+                         theme(legend.position = "none") +
+                         labs(x = .y))) 
+
+finalplots
+
+```
+
+
+```{r}
+finalplots$plot
+```
+
+## Exporting the data
+```{r}
+write_csv(weather_s_wide,"../data/weather_s_wide.csv")  
+```
+
